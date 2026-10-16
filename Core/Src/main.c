@@ -29,6 +29,8 @@
 #include "CAN_receive.h"
 #include "remote_control.h"
 #include "bsp_rc.h"
+/* 转速环 PID。这个文件由官方提供，本次没有改动 */
+#include "pid.h"
 /* sinf()，UART6 正弦波输出要用 */
 #include <math.h>
 /* USER CODE END Includes */
@@ -46,9 +48,10 @@
 #define RC_DEAD_ZONE            20
 /* 摇杆推到底时发给 3508 的电流。C620 内部自己跑电流环，16384 对应它的满
    量程 20A，所以 1000 大约 1.2A。
-   注意这不是转速命令：电调只管把电流喂进去，电机靠摩擦和反电动势自己找平衡
-   点，所以同一个电流在不同温度、不同摩擦下转速会飘。要真正控制转速得闭环，
-   见 user/pid.c（目前还没接上）。
+   现在默认走转速闭环（下面 USE_SPEED_PID = 1），这个值只在把它置 0、退回
+   开环时才用得到。
+   开环本来就治不了"同一个电流在不同温度/摩擦下转速会飘"这件事，要控转速得
+   闭环，见下面 --- 转速环 PID --- 那段。
    还嫌快 -> 继续调小；不动了 -> 调大。 */
 #define CHASSIS_CURRENT_MAX     1000
 /* 台架测试：只让这一个 3508 动，另外三个强制给 0。
@@ -74,12 +77,15 @@
      '3' - 开始左摇杆流，两个通道：上下 -1.000~+1.000，左右 +0.500~-0.500，
            中间都是 0.000
      '4' - 停
+     '5' - 开始转速环曲线流，两个通道：第1列目标转速(rpm)，第2列实测转速(rpm)
    '2' 和 '4' 都能停任何一条流。
-   两条流都是 ASCII 十进制、逗号分列，这是 SerialPlot 要的格式。其它字节一律
-   忽略。同一时刻只能跑一条流，它们共用 UART6 这一根 TX 线。 */
+   三条流都是 ASCII 十进制、逗号分列，这是 SerialPlot 要的格式。其它字节一律
+   忽略。同一时刻只能跑一条流，它们共用 UART6 这一根 TX 线。
+   '5' 是整定 Kp/Ki 的唯一实用手段：一次性读几个数看不出超调和振荡，曲线能。 */
 #define UART6_STREAM_OFF        0
 #define UART6_STREAM_SINE       1
 #define UART6_STREAM_STICK      2
+#define UART6_STREAM_PID        3
 
 /* --- 正弦波流 ('1') --- */
 /* 一个完整周期的时长，单位 ms。400ms = 2.5Hz */
@@ -102,6 +108,45 @@
    整数输出会把整条曲线压成 -1/0/+1 三条线，所以这条流不能用 uart6_send_int()。 */
 #define RC_STICK_VERT_MILLI     1000
 #define RC_STICK_HORZ_MILLI     500
+
+/* --- 转速环 PID ---
+   摇杆 -> 目标转速 -> PID -> 电流 -> C620 -> 3508，测回来的 speed_rpm 当反馈。
+   控制环跑在 SysTick 的 1kHz 中断里，见 motor_control_1khz()。 */
+
+/* 回退开关：置 0 就退回「摇杆直接给电流」的开环控制，和接 PID 之前一模一样，
+   用来对比闭环到底有没有起作用。 */
+#define USE_SPEED_PID           1
+
+/* 摇杆推到底对应的目标转速，单位 rpm。
+   C620 反馈的是电机转子转速（不是减速箱输出轴），3508 空载约 9000，取 3000
+   留余量。
+   第一次上台架建议先改成 1000，确认转向和控制量都对了再往上加。 */
+#define SPEED_TARGET_MAX_RPM    3000
+
+/* PID 三参数。还没整定过 —— 电机和电调现在都拆着，测不了，所以这几个数只是
+   一个保守的起点，不是整定结果。
+   顺序建议：Kd 保持 0、Ki 先给 0，只加 Kp 到「响应够快、刚出现一点过冲」再
+   退一档；然后慢慢加 Ki 把稳态残差压下去。全程开着 '5' 曲线流看。
+   Ki 不能随手给：pid.c 的积分是 Iout += Ki * error，纯累加、没有乘 dt，所以
+   Ki 的物理含义和 1kHz 这个调用周期是绑死的，换了控制周期就得重新整定。 */
+#define SPEED_PID_KP            10.0f
+#define SPEED_PID_KI            0.2f
+#define SPEED_PID_KD            0.0f
+
+/* PID 输出上限，也就是电流上限。3508 额定 10A 对应约 8192 计数；这里取 3000
+   （约 3.7A），空载台架够用，也更安全。转不动再往上加。 */
+#define SPEED_PID_MAX_OUT       3000.0f
+
+/* 积分项独立上限，防止堵转时积分一直往里累（积分饱和），一松手电机猛冲。 */
+#define SPEED_PID_MAX_IOUT      2000.0f
+
+/* 电机物理装反了改这里：填 1 或 -1。
+   注意它翻的是「反馈」和「目标」这两个一起翻，不是翻输出 —— 闭环里只翻输出
+   会把负反馈变成正反馈，电机直接发散。推导（填 -1 的情形）：
+     正电流物理上产生负转速；摇杆推上，目标 +3000，翻完 target = -3000；
+     PID 算出负电流 -> 物理上产生正转速 -> 翻完 actual 为负 -> 误差往 0 收。
+     负反馈成立。 */
+#define MOTOR_DIR_SIGN          1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -113,10 +158,26 @@
 
 /* USER CODE BEGIN PV */
 /* 遥控链路看门狗。rc_frame_count 在 remote_control.c 里，由 DBUS 中断自增；
-   其余三个在主循环里更新。 */
+   其余三个在 motor_control_1khz() 里更新，也就是 SysTick 中断上下文。
+   rc_online 主循环里的 uart6_task() 也要读，所以是 volatile。 */
 static uint32_t rc_last_frame_count = 0;
 static uint32_t rc_last_frame_tick  = 0;
-static uint8_t  rc_online           = 0;
+static volatile uint8_t rc_online   = 0;
+
+/* 转速环 PID 实例。参数在 main() 的 PID_init() 里填。 */
+static pid_type_def speed_pid;
+
+/* 控制环总开关。main() 里 can_filter_init() 和 PID_init() 都做完了才置 1 ——
+   HAL_Init() 一返回 SysTick 就开始跑，那时 CAN 和 PID 都还没准备好。
+   主循环里那段落 bus-off 恢复也会临时清 0，挡住中断里的 CAN 发送。 */
+volatile uint8_t control_enabled = 0;
+
+/* 观测变量，给 UART6 的 '5' 曲线流和 Keil Watch 用。
+   都在 1kHz 中断里写、主循环里读，但全是单次 16 位读写，对中断天然原子，
+   不需要临界区。 */
+volatile int16_t motor_target_rpm  = 0;
+volatile int16_t motor_actual_rpm  = 0;
+volatile int16_t motor_current_cmd = 0;
 
 /* 上电时抓的时间戳，PH11 用它算自己的点亮窗口 */
 static uint32_t boot_tick = 0;
@@ -134,34 +195,6 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/**
-  * @brief          把一个 DT7 通道值换算成电机电流
-  * @param[in]      channel: 已经减掉 RC_CH_VALUE_OFFSET 的通道值，
-  *                 约 -660~+660，摇杆回中时为 0
-  * @param[in]      max_current: 摇杆推到底时发的电流
-  * @retval         电机电流，-max_current~+max_current，回中时为 0
-  */
-static int16_t rc_to_current(int16_t channel, int16_t max_current)
-{
-  int32_t value = channel;
-
-  if (value > -RC_DEAD_ZONE && value < RC_DEAD_ZONE)
-  {
-    value = 0;
-  }
-
-  if (value > RC_CH_VALUE_RANGE)
-  {
-    value = RC_CH_VALUE_RANGE;
-  }
-  else if (value < -RC_CH_VALUE_RANGE)
-  {
-    value = -RC_CH_VALUE_RANGE;
-  }
-
-  return (int16_t)(value * max_current / RC_CH_VALUE_RANGE);
-}
-
 /**
   * @brief          把 1~3 个整数作为一行、逗号分隔发出去
   * @param[in]      values: 每个都会被夹到 -99999~99999
@@ -330,13 +363,123 @@ static int32_t rc_stick_normalize(int16_t ch, int32_t full_milli)
 }
 
 /**
+  * @brief          转速环控制，跑在 SysTick 的 1kHz 中断里
+  * @param[in]      none
+  * @retval         none
+  * @note           为什么放中断里而不是主循环里：pid.c 的积分是
+  *                 Iout += Ki * error，纯累加、没有乘 dt，所以 Ki 的物理含义
+  *                 直接绑死在调用周期上，周期一抖积分就在瞎积。而主循环里有
+  *                 HAL_Delay(2) 和会阻塞的串口发送，周期在 2~4ms 之间抖 ——
+  *                 更巧的是整定时必然开着 '5' 曲线流，抖动正好发生在最要它稳
+  *                 的时候。
+  *                 工程里没有定时器（HAL_TIM_MODULE_ENABLED 是注释掉的），但
+  *                 SysTick 本来就跑着，而且正好是 1ms，直接白捡一个准周期，
+  *                 不用动时钟配置，也不用加外设。
+  *                 PID 一次计算约 50 条浮点指令，168MHz 下不到 1µs，1ms 的预算
+  *                 有三位数余量。
+  *                 优先级 15（最低），CAN 接收中断（优先级 0）会抢占这里。这是
+  *                 安全的：这里读 speed_rpm 是单条 LDRH；这里写发送邮箱碰的是
+  *                 TSR + sTxMailBox[].TIR/TDTR/TDHR/TDLR，而接收路径
+  *                 HAL_CAN_GetRxMessage 只碰 RF0R/RDLR/RDHR/RDTR/RI0R，两组寄
+  *                 存器不重叠，hcan->State 双方都只读。
+  *                 由 stm32f4xx_it.c 的 SysTick_Handler 调用，必须在
+  *                 HAL_IncTick() 之后 —— 这样这里 HAL_GetTick() 拿到的是本 tick
+  *                 的值。
+  */
+void motor_control_1khz(void)
+{
+  const RC_ctrl_t       *rc      = get_remote_control_point();
+  const motor_measure_t *measure = get_chassis_motor_measure_point(SINGLE_MOTOR_INDEX);
+  uint32_t frame_count;
+  uint32_t now;
+  int16_t  current;
+
+  /* 上电后 SysTick 就在跑，那时 PID_init() 还没执行、CAN 滤波器也还没配。
+     这个标志把控制环整个挡住，直到 main() 里初始化完成。 */
+  if (!control_enabled)
+  {
+    return;
+  }
+
+  now = HAL_GetTick();
+  frame_count = rc_frame_count;
+
+  /* 遥控链路看门狗。rc_ctrl 的内容会一直保留上一帧的值，所以判断链路是否活着
+     要看帧计数而不是数据本身。第一帧到来之前 rc_online 一直是 0。 */
+  if (frame_count != rc_last_frame_count)
+  {
+    rc_last_frame_count = frame_count;
+    rc_last_frame_tick  = now;
+    rc_online = 1;
+  }
+  else if ((now - rc_last_frame_tick) >= RC_SIGNAL_TIMEOUT_MS)
+  {
+    rc_online = 0;
+  }
+
+  /* speed_rpm 是电调反馈的电机转子转速（3508 空载约 9000），不是减速箱输出轴。
+     单条 16 位读，对 CAN 接收中断是原子的。
+     放在 #if 外面：开环回退时也要更新，否则 '5' 流的第二列恒为 0。 */
+  motor_actual_rpm = measure->speed_rpm;
+
+#if USE_SPEED_PID
+  if (rc_online)
+  {
+    /* 摇杆位置 -> 目标转速，回中为 0，推到底 ±SPEED_TARGET_MAX_RPM */
+    motor_target_rpm = (int16_t)rc_stick_normalize(rc->rc.ch[RC_MOTOR_CHANNEL],
+                                                   SPEED_TARGET_MAX_RPM);
+  }
+  else
+  {
+    /* 掉线：目标归零，并且清掉积分。不清的话掉线期间积分项会继续往里累，
+       摇杆一回来电机会猛地弹一下。
+       只发 0 电流也不行 —— 那样连 P 项都不起作用，残余转速要慢慢才停。 */
+    motor_target_rpm = 0;
+    PID_clear(&speed_pid);
+  }
+
+  /* 方向反转只能把「反馈」和「目标」两个一起翻，输出保持原样。只翻输出会把
+     负反馈变成正反馈，电机发散。推导见 MOTOR_DIR_SIGN 的注释。 */
+  {
+    fp32 actual = (fp32)MOTOR_DIR_SIGN * (fp32)motor_actual_rpm;
+    fp32 target = (fp32)MOTOR_DIR_SIGN * (fp32)motor_target_rpm;
+
+    /* 实参顺序是 (pid, 反馈, 目标)：pid.c 里算的是 set - ref，所以实测转速在
+       前、目标转速在后。写反了同样变成正反馈。 */
+    current = (int16_t)PID_calc(&speed_pid, actual, target);
+  }
+#else
+  /* 回退到开环：摇杆直接映射电流，和接 PID 之前的行为一致，方便对比 */
+  {
+    int32_t open_loop = rc_online
+                      ? rc_stick_normalize(rc->rc.ch[RC_MOTOR_CHANNEL],
+                                           CHASSIS_CURRENT_MAX)
+                      : 0;
+
+    /* 开环没有「目标转速」这个概念，motor_target_rpm 保持 0，不要拿电流去填它。 */
+    PID_clear(&speed_pid);
+    current = (int16_t)open_loop;
+  }
+#endif
+
+  motor_current_cmd = current;
+
+  /* 台架测试：只驱动 SINGLE_MOTOR_INDEX 那一个，另外三个恒给 0，不然没接电机
+     的那几路也一直在往总线上打命令。 */
+  CAN_cmd_chassis((SINGLE_MOTOR_INDEX == 0) ? current : 0,
+                  (SINGLE_MOTOR_INDEX == 1) ? current : 0,
+                  (SINGLE_MOTOR_INDEX == 2) ? current : 0,
+                  (SINGLE_MOTOR_INDEX == 3) ? current : 0);
+}
+
+/**
   * @brief          UART6 调试流
   * @param[in]      now: 调用方抓的 HAL_GetTick() 值
   * @param[in]      rc: 最新的遥控帧
   * @param[in]      rc_online: 1 表示遥控器还在跟我们说话
   * @retval         none
-  * @note           '1' 开正弦波流，'3' 开摇杆流，'2'/'4' 停。每个主循环调一次，
-  *                 一次最多阻塞一短行的时间。
+  * @note           '1' 开正弦波流，'3' 开摇杆流，'5' 开转速环曲线流，'2'/'4' 停。
+  *                 每个主循环调一次，一次最多阻塞一短行的时间。
   */
 static void uart6_task(uint32_t now, const RC_ctrl_t *rc, uint8_t rc_online)
 {
@@ -358,6 +501,10 @@ static void uart6_task(uint32_t now, const RC_ctrl_t *rc, uint8_t rc_online)
     else if (cmd == '3')
     {
       uart6_stream = UART6_STREAM_STICK;
+    }
+    else if (cmd == '5')
+    {
+      uart6_stream = UART6_STREAM_PID;
     }
     else if (cmd == '2' || cmd == '4')
     {
@@ -395,6 +542,16 @@ static void uart6_task(uint32_t now, const RC_ctrl_t *rc, uint8_t rc_online)
     }
 
     uart6_send_milli(columns, 2u);
+  }
+  else if (uart6_stream == UART6_STREAM_PID)
+  {
+    /* 第 1 列 = 目标转速，第 2 列 = 实测转速，单位都是 rpm。
+       两个都是中断里写的 volatile，这里读到的是同一时刻附近的快照 —— 曲线的
+       周期比控制周期慢两个数量级，差一个采样周期看不出来。
+       用整数流就够：这里的分辨率是 1rpm，不是摇杆流那种会被压成几条线的量。 */
+    columns[0] = motor_target_rpm;
+    columns[1] = motor_actual_rpm;
+    uart6_send_int(columns, 2u);
   }
 }
 /* USER CODE END 0 */
@@ -442,6 +599,18 @@ int main(void)
   /* PH11 现在点亮，RUN_LED_ON_MS 之后灭 */
   boot_tick = HAL_GetTick();
   HAL_GPIO_WritePin(RUN_LED_PORT, RUN_LED_PIN, GPIO_PIN_SET);
+
+  /* 转速环 PID。CAN 和遥控都配好了再初始化，最后才放开控制环 ——
+     SysTick 从 HAL_Init() 起就在跑，放开的时机决定了中断里第一帧会不会打到
+     一个没配好的外设上。 */
+  {
+    const fp32 speed_pid_para[3] = {SPEED_PID_KP, SPEED_PID_KI, SPEED_PID_KD};
+
+    PID_init(&speed_pid, PID_POSITION, speed_pid_para,
+             SPEED_PID_MAX_OUT, SPEED_PID_MAX_IOUT);
+  }
+
+  control_enabled = 1;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -452,52 +621,48 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     const RC_ctrl_t *rc = get_remote_control_point();
-    uint32_t frame_count = rc_frame_count;
     uint32_t now = HAL_GetTick();
-    int16_t throttle;
-
-    /* 遥控器还在说话吗？rc_ctrl 的值会一直保留，所以判断链路是否活着要看帧
-       计数而不是数据本身。第一帧到来之前 rc_online 一直是 0。 */
-    if (frame_count != rc_last_frame_count)
-    {
-      rc_last_frame_count = frame_count;
-      rc_last_frame_tick  = now;
-      rc_online = 1;
-    }
-    else if ((now - rc_last_frame_tick) >= RC_SIGNAL_TIMEOUT_MS)
-    {
-      rc_online = 0;
-    }
 
     /* PH11：上电后亮 RUN_LED_ON_MS，之后灭 */
     HAL_GPIO_WritePin(RUN_LED_PORT, RUN_LED_PIN,
                       ((now - boot_tick) < RUN_LED_ON_MS) ? GPIO_PIN_SET : GPIO_PIN_RESET);
 
-    /* 台架测试：左摇杆上下驱动一个 3508，另外三个给 0。SINGLE_MOTOR_INDEX
-       决定是哪一个。
-       这里只读上下轴，左右推到底电机也不动。
-       上是正转（正电流），下是反转。
-       掉线时命令 0 很重要：不然 rc_ctrl 会保留最后的摇杆位置，电机就飞了。 */
-    throttle = rc_online ? rc_to_current(rc->rc.ch[RC_MOTOR_CHANNEL],
-                                         CHASSIS_CURRENT_MAX) : 0;
-
-    /* 电机转向反了，就把下面 "throttle" 前面加个负号 */
-    CAN_cmd_chassis((SINGLE_MOTOR_INDEX == 0) ? throttle : 0,
-                    (SINGLE_MOTOR_INDEX == 1) ? throttle : 0,
-                    (SINGLE_MOTOR_INDEX == 2) ? throttle : 0,
-                    (SINGLE_MOTOR_INDEX == 3) ? throttle : 0);
+    /* --- CAN1 bus-off 自动恢复 ---
+       can.c 里 hcan1 是 AutoBusOff = DISABLE、AutoRetransmission = ENABLE 的。
+       电调不在总线上时，0x200 发出去没人 ACK，无限重传，TEC 涨过 255 就进
+       bus-off，而且 AutoBusOff 关着意味着它不会自己回来 —— 之后把电调接回去，
+       CAN1 依然是死的，只能重新上电。所以这里自己接回来。
+       同时 AutoRetransmission 开着时 3 个发送邮箱几毫秒就占满，
+       HAL_CAN_AddTxMessage 之后全部静默返回 HAL_ERROR。
+       电调一直不在的话这段会每隔几毫秒跑一次（重新配好、又 bus-off、再配），
+       属于预期行为，不是死循环。
+       放在主循环而不是 1kHz 中断里：HAL_CAN_Init() 会把 CAN 外设整个复位重配，
+       而 CAN1_RX0 中断（优先级 0）能抢占 SysTick（优先级 15），在中断里重配一个
+       会被更高优先级中断访问的外设是自找麻烦。bus-off 恢复也不是实时任务。 */
+    if ((CHASSIS_CAN.Instance->ESR & CAN_ESR_BOFF) != 0u)
+    {
+      control_enabled = 0;              /* 挡住中断里的 CAN 发送 */
+      HAL_CAN_Init(&CHASSIS_CAN);
+      can_filter_init();
+      control_enabled = 1;
+    }
 
     /* 让云台电机保持不动；没有云台就删掉这行 */
     CAN_cmd_gimbal(0, 0, 0, 0);
 
-    /* UART6 调试：'1' 正弦波，'3' 左摇杆，'2'/'4' 停。故意放在 CAN 发完之后，
-       这样慢的串口不会拖慢电机命令。 */
+    /* 电机命令不在这里发：遥控看门狗和 CAN_cmd_chassis 都在 1kHz 的
+       motor_control_1khz() 里，那边周期才稳。
+
+       UART6 调试：'1' 正弦波，'3' 左摇杆，'5' 转速环曲线，'2'/'4' 停。
+       故意放在最后，这样慢的串口不会拖慢别的东西。 */
     uart6_task(now, rc, rc_online);
 
     HAL_Delay(2);
 
     /* 想看原始遥控值时，打开 Keil 的 Watch 窗口加 "rc_ctrl.rc.ch" 就行，
-       不用 printf（USART3 被 DBUS 接收占着，打不了）。 */
+       不用 printf（USART3 被 DBUS 接收占着，打不了）。
+       Watch 里加 motor_target_rpm / motor_actual_rpm / motor_current_cmd
+       能直接看闭环在干什么，不想开曲线流的时候用。 */
   }
   /* USER CODE END 3 */
 }

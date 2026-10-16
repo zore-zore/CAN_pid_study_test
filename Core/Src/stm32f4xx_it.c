@@ -194,6 +194,16 @@ void SysTick_Handler(void)
   HAL_IncTick();
   /* USER CODE BEGIN SysTick_IRQn 1 */
 
+  /* 转速环 PID，1kHz。必须放在 HAL_IncTick() 之后：控制环里读 HAL_GetTick()
+     当遥控看门狗的时间戳，放前面会拿到上一个 tick 的值。
+     定义在 main.c 的 USER CODE 0 区，那里有完整的理由说明为什么控制环放在
+     中断里而不是主循环里。 */
+  {
+    extern void motor_control_1khz(void);
+
+    motor_control_1khz();
+  }
+
   /* USER CODE END SysTick_IRQn 1 */
 }
 
