@@ -148,5 +148,14 @@ extern const motor_measure_t *get_trigger_motor_measure_point(void);
   */
 extern const motor_measure_t *get_chassis_motor_measure_point(uint8_t i);
 
+/**
+  * @brief          判断某一路底盘电机的反馈是否新鲜
+  * @param[in]      i: 电机编号,范围[0,3]
+  * @param[in]      now: 调用方抓的 HAL_GetTick()
+  * @param[in]      timeout_ms: 超过这么久没收到新帧就算掉线
+  * @retval         1 有效, 0 掉线或从未收到过
+  */
+extern uint8_t chassis_motor_is_online(uint8_t i, uint32_t now, uint32_t timeout_ms);
+
 
 #endif

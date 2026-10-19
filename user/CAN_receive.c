@@ -34,11 +34,18 @@ extern CAN_HandleTypeDef hcan2;
         (ptr)->temperate = (data)[6];                                   \
     }
 /*
-motor data,  0:chassis motor1 3508;1:chassis motor3 3508;2:chassis motor3 3508;3:chassis motor4 3508;
+motor data,  0:chassis motor1 3508;1:chassis motor2 3508;2:chassis motor3 3508;3:chassis motor4 3508;
 4:yaw gimbal motor 6020;5:pitch gimbal motor 6020;6:trigger motor 2006;
 电机数据, 0:底盘电机1 3508电机,  1:底盘电机2 3508电机,2:底盘电机3 3508电机,3:底盘电机4 3508电机;
 4:yaw云台电机 6020电机; 5:pitch云台电机 6020电机; 6:拨弹电机 2006电机*/
 static motor_measure_t motor_chassis[7];
+
+/* 每路电机最近一次收到反馈的 tick，以及是否至少收到过一帧（按位）。
+   四轮共享速度环靠它剔除掉线的轮子：motor_chassis[] 收不到帧时会一直停在
+   初值 0，当成真实转速算进平均会把整车速度带偏。
+   uint32 单次读写是原子的，CAN 接收中断写、1kHz 控制中断读，不需要临界区。 */
+static volatile uint32_t motor_last_rx_tick[7];
+static volatile uint8_t  motor_rx_seen = 0;
 
 static CAN_TxHeaderTypeDef  gimbal_tx_message;
 static uint8_t              gimbal_can_send_data[8];
@@ -72,10 +79,13 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
         case CAN_PIT_MOTOR_ID:
         case CAN_TRIGGER_MOTOR_ID:
         {
-            static uint8_t i = 0;
+            uint8_t i;
             //get motor id
             i = rx_header.StdId - CAN_3508_M1_ID;
             get_motor_measure(&motor_chassis[i], rx_data);
+            /* 记录收帧时刻和「收到过」标志，供四轮速度环判断反馈是否新鲜 */
+            motor_last_rx_tick[i] = HAL_GetTick();
+            motor_rx_seen |= (uint8_t)(1u << i);
             break;
         }
 
@@ -247,4 +257,25 @@ const motor_measure_t *get_trigger_motor_measure_point(void)
 const motor_measure_t *get_chassis_motor_measure_point(uint8_t i)
 {
     return &motor_chassis[(i & 0x03)];
+}
+
+/**
+  * @brief          判断某一路底盘电机的反馈是否新鲜
+  * @param[in]      i: 电机编号,范围[0,3]
+  * @param[in]      now: 调用方抓的 HAL_GetTick()
+  * @param[in]      timeout_ms: 超过这么久没收到新帧就算掉线
+  * @retval         1 有效, 0 掉线或从未收到过
+  * @note           没收到过和掉线要分开：上电初期 last_rx_tick 还是 0，
+  *                 单看时间差会把「从未收到」误判成新鲜，所以另存 seen 位。
+  */
+uint8_t chassis_motor_is_online(uint8_t i, uint32_t now, uint32_t timeout_ms)
+{
+    uint8_t idx = (uint8_t)(i & 0x03);
+
+    if ((motor_rx_seen & (uint8_t)(1u << idx)) == 0u)
+    {
+        return 0;
+    }
+
+    return (uint8_t)((now - motor_last_rx_tick[idx]) < timeout_ms);
 }

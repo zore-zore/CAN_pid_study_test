@@ -1,0 +1,29 @@
+# Keil MDK build outputs
+MDK-ARM/**/*.o
+MDK-ARM/**/*.d
+MDK-ARM/**/*.crf
+MDK-ARM/**/*.dep
+MDK-ARM/**/*.axf
+MDK-ARM/**/*.hex
+MDK-ARM/**/*.bin
+MDK-ARM/**/*.map
+MDK-ARM/**/*.lnp
+MDK-ARM/**/*.sct
+MDK-ARM/**/*.htm
+MDK-ARM/**/*.lst
+MDK-ARM/**/*._ia
+MDK-ARM/**/*.iex
+MDK-ARM/**/*.bak
+MDK-ARM/DebugConfig/
+MDK-ARM/RTE/
+MDK-ARM/Listings/
+MDK-ARM/Objects/
+*.uvguix.*
+*.uvoptx
+*.scvd
+
+# 通用
+build/
+Debug/
+Release/
+.vscode/
